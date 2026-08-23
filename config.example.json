@@ -1,8 +1,5 @@
 {
-  "litensi_api_id": "",
-  "litensi_api_key": "",
-  "litensi_site": "github.com",
-  "litensi_zone": "",
+  "mailcx_domain": "",
   "register_count": 1,
   "proxy": "",
   "headless": false,

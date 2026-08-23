@@ -18,7 +18,7 @@ from camoufox.sync_api import Camoufox
 import requests
 
 from .config import Config
-from .litensi import LitensiClient, LitensiError
+from .mailcx import MailCxClient, MailCxError
 from .profiles import (
     generate_password,
     generate_username,
@@ -551,15 +551,9 @@ def _reject_blocked(page) -> None:
             raise SignupBlocked(f"github risk check: {marker}")
 
 
-def _cancel_order(lit: LitensiClient, order_id: str, log) -> None:
-    try:
-        lit.set_status(order_id, "CANCELED")
-        log(f"[*] litensi order {order_id} canceled")
-    except Exception as exc:
-        if "CANCEL AFTER" in str(exc):
-            log(f"[i] litensi order {order_id} auto-expires (cancel only allowed after 4 min)")
-        else:
-            log(f"[!] cancel order failed: {exc}")
+def _cancel_order(mail: MailCxClient, order_id: str, log) -> None:
+    """No-op for mail.cx — no order to cancel."""
+    pass
 
 
 def _is_hard_block(page) -> bool:
@@ -1736,7 +1730,7 @@ def _fill_signup_form(page, cfg, email, password, log, stop) -> str:
 
 def _post_form_flow(
     page, context, cfg: Config, email: str, password: str, username: str,
-    lit: LitensiClient, order_id: str, log, stop,
+    mail: MailCxClient, order_id: str, log, stop,
 ) -> tuple[str, str, str]:
     """Everything AFTER the signup form was accepted: email verification
     (launch code), auto-login, first repository (stage 4), TOTP 2FA (stage 5).
@@ -1746,22 +1740,16 @@ def _post_form_flow(
     state = _wait_post_submit(page, context, timeout=120, log=log, stop=stop)
     if state == "verify":
         log(f"[*] verification page: {page.url}")
-        code = lit.wait_for_code(
+        code = mail.wait_for_code(
             order_id,
-            email=email,
             timeout=cfg.otp_timeout_sec,
             log=log,
             cancel_cb=stop,
         )
         log(f"[*] verification code: {code}")
         _fill_launch_code(page, code, log)
-        # confirm the activation with Litensi: code was used (setstatus SUCCESS)
-        try:
-            delivered = lit.last_order_id or order_id
-            lit.mark_success(delivered)
-            log(f"[*] litensi order {delivered} confirmed SUCCESS")
-        except Exception as exc:
-            log(f"[i] litensi confirm SUCCESS failed: {exc}")
+        # mail.cx has no order confirmation — code already extracted
+        log(f"[*] verification code extracted and submitted")
         # after OTP: must reach a logged-in state
         state2 = _wait_post_submit(page, context, timeout=90, log=log, stop=stop)
         if state2 == "verify":
@@ -1834,7 +1822,7 @@ def _run_signup(
     cfg: Config,
     email: str,
     password: str,
-    lit: LitensiClient,
+    mail: MailCxClient,
     order_id: str,
     log,
     stop,
@@ -1953,7 +1941,7 @@ def _run_signup(
             # form accepted — continue with the rest of the flow in this same session
             return _post_form_flow(
                 page, context, cfg, email, password, username,
-                lit, order_id, log, stop,
+                mail, order_id, log, stop,
             )
             # non-SignupError exceptions propagate immediately (with-block closes browser)
     raise SignupError(
@@ -1967,9 +1955,9 @@ def register_one(
 ) -> Optional[str]:
     """Register one account; returns its one-line account record or None."""
     stop = cancel_cb or (lambda: False)
-    lit = LitensiClient(cfg.litensi_api_id, cfg.litensi_api_key, cfg.litensi_site, cfg.litensi_zone)
-    email, order_id = lit.create_mailbox()
-    log(f"[*] mailbox: {email} (order {order_id})")
+    mail = MailCxClient(domain=cfg.mailcx_domain)
+    email, order_id = mail.create_mailbox()
+    log(f"[*] mailbox: {email} (mail.cx)")
     try:
         password = generate_password()
         hard_left = int(getattr(cfg, "proxy_hard_block_retries", 0) or 0) if cfg.proxy else 0
@@ -1978,7 +1966,7 @@ def register_one(
             _raise_if_cancelled(stop)
             try:
                 username, totp_secret, recovery = _run_signup(
-                    cfg, email, password, lit, order_id, log, stop
+                    cfg, email, password, mail, order_id, log, stop
                 )
                 break
             except SignupBlocked as exc:
@@ -2010,11 +1998,8 @@ def register_one(
         log(f"[-] account failed: {exc}")
         return None
     finally:
-        # order already confirmed SUCCESS -> nothing to cancel; else free the mailbox
-        if lit.last_order_id:
-            log("[*] mailbox already confirmed (SUCCESS) — no cancel needed")
-        else:
-            _cancel_order(lit, order_id, log)
+        # mail.cx: no order to cancel or confirm
+        log("[*] mailbox cleanup: no action needed (mail.cx)")
 
 
 def run_job(
@@ -2045,7 +2030,7 @@ def run_job(
     ACCOUNTS_DIR.mkdir(parents=True, exist_ok=True)
     out = ACCOUNTS_DIR / f"github_accounts_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
     ok = fail = 0
-    log(f"[*] github-regkit | engine=Camoufox (Firefox anti-detect) | site={cfg.litensi_site} "
+    log(f"[*] github-regkit | engine=Camoufox (Firefox anti-detect) | mail_provider=mail.cx "
         f"| headless={cfg.headless} | target={cfg.register_count} | output={out.name}")
     _emit_progress(ok, fail)  # initial snapshot: 0/0
     try:
@@ -2064,8 +2049,8 @@ def run_job(
             except GitHubRateLimited as exc:
                 log(f"[!] rate-limit retries exhausted — stopping job: {exc}")
                 break
-            except LitensiError as exc:  # provider-level error: abort job, not just this account
-                log(f"[!] litensi error, aborting: {exc}")
+            except MailCxError as exc:  # provider-level error: abort job, not just this account
+                log(f"[!] mail.cx error, aborting: {exc}")
                 break
             if line:
                 with out.open("a", encoding="utf-8") as f:
