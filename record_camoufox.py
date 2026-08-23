@@ -341,7 +341,7 @@ def main() -> int:
         # browser already closed by the user (TargetClosedError etc.) — that's
         # a NORMAL exit path, not a failure. Recording stays intact.
         if "TargetClosedError" in type(exc).__name__ or "target" in str(exc).lower() or "closed" in str(exc).lower():
-        print("\n[*] browser closed — recording saved", flush=True)
+            print("\n[*] browser closed — recording saved", flush=True)
         else:
             print(f"\n[!] recorder error: {exc}", flush=True)
     finally:
@@ -349,7 +349,7 @@ def main() -> int:
         if events:
             _dump(events, args.out)
         else:
-        print("[!] no events were recorded")
+            print("[!] no events were recorded")
     return 0
 
 
