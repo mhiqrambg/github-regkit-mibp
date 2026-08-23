@@ -63,3 +63,4 @@ regkit_codebuddy.*
 *.log
 *.tmp
 .DS_Store
+proxies.txt

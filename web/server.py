@@ -38,7 +38,7 @@ PORT = int(os.getenv("GITHUB_REGISTER_PORT") or "8093")  # 8092 is used by grok-
 
 DIST = ROOT / "frontend" / "dist"
 
-SECRET_FIELDS = {"proxy"}
+SECRET_FIELDS = {"proxy", "litensi_api_key"}
 
 
 def _migrate_legacy_account_files() -> None:
@@ -147,7 +147,12 @@ class StartBody(BaseModel):
 
 
 class ConfigBody(BaseModel):
+    mail_provider: Optional[str] = None
     mailcx_domain: Optional[str] = None
+    litensi_api_id: Optional[str] = None
+    litensi_api_key: Optional[str] = None
+    litensi_site: Optional[str] = None
+    litensi_zone: Optional[str] = None
     register_count: Optional[int] = None
     proxy: Optional[str] = None
     headless: Optional[bool] = None
@@ -295,6 +300,37 @@ async def api_mailcx_domains(
         "domains": domains,
         "current_domain": cfg.mailcx_domain or "",
     }
+
+
+class LitensiZoneBody(BaseModel):
+    litensi_api_id: Optional[str] = None
+    litensi_api_key: Optional[str] = None
+    litensi_site: Optional[str] = None
+
+
+@app.post("/api/litensi/zones")
+async def api_litensi_zones(
+    body: LitensiZoneBody, x_access_key: Optional[str] = Header(None)
+) -> Dict[str, Any]:
+    """Return Litensi zones (prices + stock) for the configured site."""
+    _require_auth(x_access_key)
+    cfg = load_config(ROOT / "config.json")
+    api_id = body.litensi_api_id or cfg.litensi_api_id or ""
+    api_key = body.litensi_api_key or cfg.litensi_api_key or ""
+    site = body.litensi_site or cfg.litensi_site or ""
+    if not api_id or not api_key:
+        raise HTTPException(status_code=400, detail="litensi_api_id and litensi_api_key are required")
+    if not site:
+        raise HTTPException(status_code=400, detail="litensi_site is required (e.g. github.com)")
+    try:
+        from github_register.litensi import LitensiClient
+        client = LitensiClient(api_id=api_id, api_key=api_key, site=site)
+        zones = client.prices()
+        stock = [z for z in zones if float(z.get("stock") or 0) > 0]
+        cheapest = min(stock, key=lambda z: float(z.get("price") or 0))["zone"] if stock else ""
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Unable to contact Litensi: {exc}")
+    return {"ok": True, "zones": zones, "site": site, "cheapest": cheapest}
 
 
 @app.get("/api/status")

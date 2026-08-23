@@ -18,6 +18,7 @@ from camoufox.sync_api import Camoufox
 import requests
 
 from .config import Config
+from .litensi import LitensiClient, LitensiError
 from .mailcx import MailCxClient, MailCxError
 from .profiles import (
     generate_password,
@@ -442,6 +443,30 @@ def _rotate_sticky_proxy() -> None:
     _last_exit_ip = None
 
 
+def _disable_blocked_proxy(log) -> None:
+    """Tell the proxy rotator to permanently disable the current upstream proxy.
+
+    POST to http://127.0.0.1:8100/disable — the rotator comments out the proxy
+    in proxies.txt so it's never used again.
+    """
+    try:
+        import urllib.request
+        req = urllib.request.Request(
+            "http://127.0.0.1:8100/disable",
+            data=b"{}",
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        resp = urllib.request.urlopen(req, timeout=5)
+        data = json.loads(resp.read())
+        if data.get("ok"):
+            log(f"[!] permanently disabled proxy: {data.get('disabled')} ({data.get('remaining')} remaining)")
+        else:
+            log(f"[i] proxy disable: {data}")
+    except Exception as exc:
+        log(f"[i] could not disable proxy via rotator: {exc}")
+
+
 def _proxy_needs_bridge(proxy: Optional[dict]) -> bool:
     """Firefox rejects authed SOCKS5; bridge it locally."""
     return bool(proxy) and str(proxy.get("server", "")).startswith("socks") and proxy.get("username")
@@ -551,9 +576,17 @@ def _reject_blocked(page) -> None:
             raise SignupBlocked(f"github risk check: {marker}")
 
 
-def _cancel_order(mail: MailCxClient, order_id: str, log) -> None:
-    """No-op for mail.cx — no order to cancel."""
-    pass
+def _cancel_order(mail, order_id: str, log) -> None:
+    """Cancel the Litensi order if we bail before code is consumed.
+
+    For Mail.cx this is a no-op (no order system).
+    """
+    if isinstance(mail, LitensiClient) and order_id:
+        try:
+            mail.set_status(order_id, "CANCELED")
+            log(f"[*] litensi order {order_id} canceled")
+        except Exception as exc:
+            log(f"[i] litensi cancel failed (non-fatal): {exc}")
 
 
 def _is_hard_block(page) -> bool:
@@ -1730,7 +1763,7 @@ def _fill_signup_form(page, cfg, email, password, log, stop) -> str:
 
 def _post_form_flow(
     page, context, cfg: Config, email: str, password: str, username: str,
-    mail: MailCxClient, order_id: str, log, stop,
+    mail, order_id: str, log, stop,
 ) -> tuple[str, str, str]:
     """Everything AFTER the signup form was accepted: email verification
     (launch code), auto-login, first repository (stage 4), TOTP 2FA (stage 5).
@@ -1745,6 +1778,7 @@ def _post_form_flow(
             timeout=cfg.otp_timeout_sec,
             log=log,
             cancel_cb=stop,
+            email=email,
         )
         log(f"[*] verification code: {code}")
         _fill_launch_code(page, code, log)
@@ -1955,9 +1989,21 @@ def register_one(
 ) -> Optional[str]:
     """Register one account; returns its one-line account record or None."""
     stop = cancel_cb or (lambda: False)
-    mail = MailCxClient(domain=cfg.mailcx_domain)
+
+    # --- create mail client based on provider ---
+    provider = getattr(cfg, "mail_provider", "mailcx") or "mailcx"
+    if provider == "litensi":
+        mail = LitensiClient(
+            api_id=cfg.litensi_api_id,
+            api_key=cfg.litensi_api_key,
+            site=cfg.litensi_site,
+            zone=cfg.litensi_zone,
+        )
+    else:
+        mail = MailCxClient(domain=cfg.mailcx_domain)
     email, order_id = mail.create_mailbox()
-    log(f"[*] mailbox: {email} (mail.cx)")
+    log(f"[*] mailbox: {email} ({provider})")
+
     try:
         password = generate_password()
         hard_left = int(getattr(cfg, "proxy_hard_block_retries", 0) or 0) if cfg.proxy else 0
@@ -1973,7 +2019,8 @@ def register_one(
                 if hard_left <= 0:
                     raise
                 hard_left -= 1
-                log(f"[!] DataDome hard block ({exc}); rotating sticky proxy, {hard_left} retries left")
+                log(f"[!] DataDome hard block ({exc}); disabling proxy + rotating, {hard_left} retries left")
+                _disable_blocked_proxy(log)
                 _rotate_sticky_proxy()
                 _sleep_with_cancel(5, stop)
             except GitHubRateLimited as exc:
@@ -1998,8 +2045,11 @@ def register_one(
         log(f"[-] account failed: {exc}")
         return None
     finally:
-        # mail.cx: no order to cancel or confirm
-        log("[*] mailbox cleanup: no action needed (mail.cx)")
+        if provider == "litensi":
+            # confirm or cancel the Litensi order depending on outcome
+            _cancel_order(mail, order_id, log)
+        else:
+            log("[*] mailbox cleanup: no action needed (mail.cx)")
 
 
 def run_job(
@@ -2049,8 +2099,8 @@ def run_job(
             except GitHubRateLimited as exc:
                 log(f"[!] rate-limit retries exhausted — stopping job: {exc}")
                 break
-            except MailCxError as exc:  # provider-level error: abort job, not just this account
-                log(f"[!] mail.cx error, aborting: {exc}")
+            except (MailCxError, LitensiError) as exc:  # provider-level error: abort job
+                log(f"[!] mail provider error, aborting: {exc}")
                 break
             if line:
                 with out.open("a", encoding="utf-8") as f:

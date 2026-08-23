@@ -93,6 +93,8 @@ class ProxyPool:
         self._entries: list[ProxyEntry] = []
         self._index = 0
         self._ban_threshold = ban_threshold
+        self._proxies_file = Path(proxies_file)
+        self._last_used: Optional[ProxyEntry] = None
         self._load(proxies_file)
 
     def _load(self, path: str | Path) -> None:
@@ -139,6 +141,7 @@ class ProxyPool:
                 entry = self._entries[self._index % n]
                 self._index += 1
                 if not entry.is_banned:
+                    self._last_used = entry
                     return entry
             # all banned — return the one whose ban expires soonest
             earliest = min(self._entries, key=lambda e: e.ban_until)
@@ -146,6 +149,7 @@ class ProxyPool:
             if wait > 0:
                 log.info(f"all proxies banned, waiting {int(wait)}s for {earliest.display}")
                 time.sleep(min(wait + 0.5, 60))
+            self._last_used = earliest
             return earliest
 
     def get_raw(self) -> str:
@@ -182,6 +186,85 @@ class ProxyPool:
     def on_failure(self, entry: ProxyEntry) -> None:
         with self._lock:
             entry.record_failure(self._ban_threshold)
+
+    def disable_last_used(self) -> dict:
+        """Permanently disable the last-used proxy: comment it out in the file and
+        remove from the active pool.  Returns a status dict."""
+        with self._lock:
+            entry = self._last_used
+            if not entry:
+                return {"ok": False, "error": "no proxy has been used yet"}
+            raw = entry.raw
+            host_port = f"{entry.host}:{entry.port}"
+            # remove from pool
+            idx = next((i for i, e in enumerate(self._entries) if e is entry), None)
+            if idx is not None:
+                self._entries.pop(idx)
+                if self._index >= len(self._entries):
+                    self._index = 0
+            self._last_used = None
+
+        # comment out in file
+        try:
+            lines = self._proxies_file.read_text(encoding="utf-8").splitlines(keepends=True)
+            commented = 0
+            for i, line in enumerate(lines):
+                stripped = line.strip()
+                if stripped == raw or stripped.rstrip("\r\n") == raw:
+                    if not stripped.startswith("#"):
+                        lines[i] = f"# {stripped}"
+                        commented += 1
+            if commented:
+                self._proxies_file.write_text("".join(lines), encoding="utf-8")
+                log.warning(f"PERMANENTLY DISABLED: {host_port} (commented in proxies.txt)")
+        except Exception as exc:
+            log.error(f"failed to comment out proxy in file: {exc}")
+
+        return {"ok": True, "disabled": host_port, "remaining": len(self._entries)}
+
+    def disable_by_host_port(self, host: str, port: int) -> dict:
+        """Disable a specific proxy by host:port.  If no entry matches, try
+        commenting all lines that resolve to that host:port."""
+        entry = None
+        with self._lock:
+            entry = next((e for e in self._entries if e.host == host and e.port == port), None)
+        if entry:
+            with self._lock:
+                idx = next((i for i, e in enumerate(self._entries) if e is entry), None)
+                if idx is not None:
+                    self._entries.pop(idx)
+                    if self._index >= len(self._entries):
+                        self._index = 0
+            raw = entry.raw
+        else:
+            raw = f"://{host}:{port}"
+
+        try:
+            lines = self._proxies_file.read_text(encoding="utf-8").splitlines(keepends=True)
+            commented = 0
+            for i, line in enumerate(lines):
+                stripped = line.strip()
+                if stripped.startswith("#") or not stripped:
+                    continue
+                if host in stripped and f":{port}" in stripped:
+                    lines[i] = f"# {stripped}"
+                    commented += 1
+            if commented:
+                self._proxies_file.write_text("".join(lines), encoding="utf-8")
+                log.warning(f"PERMANENTLY DISABLED: {host}:{port} ({commented} lines commented)")
+        except Exception as exc:
+            log.error(f"failed to comment out proxy: {exc}")
+
+        return {"ok": True, "disabled": f"{host}:{port}", "commented_lines": commented, "remaining": len(self._entries)}
+
+    @property
+    def last_used_info(self) -> Optional[dict]:
+        """Info about the last-used proxy."""
+        with self._lock:
+            e = self._last_used
+            if not e:
+                return None
+            return {"host": e.host, "port": e.port, "raw": e.raw}
 
 
 # ---------------------------------------------------------------------------
@@ -385,8 +468,29 @@ def _status_server(port: int, pool: ProxyPool) -> None:
                 body = json.dumps({
                     "total": pool.count(),
                     "active": pool.active_count(),
+                    "last_used": pool.last_used_info,
                     "proxies": pool.status(),
                 }).encode()
+                resp = (
+                    f"HTTP/1.1 200 OK\r\n"
+                    f"Content-Type: application/json\r\n"
+                    f"Content-Length: {len(body)}\r\n"
+                    f"Connection: close\r\n\r\n"
+                ).encode() + body
+            elif b"POST /disable" in data:
+                # Parse JSON body
+                try:
+                    body_start = data.find(b"\r\n\r\n")
+                    body_bytes = data[body_start + 4:] if body_start >= 0 else b""
+                    req = json.loads(body_bytes) if body_bytes else {}
+                except Exception:
+                    req = {}
+                # disable last used or specific host:port
+                if "host" in req and "port" in req:
+                    result = pool.disable_by_host_port(req["host"], int(req["port"]))
+                else:
+                    result = pool.disable_last_used()
+                body = json.dumps(result).encode()
                 resp = (
                     f"HTTP/1.1 200 OK\r\n"
                     f"Content-Type: application/json\r\n"

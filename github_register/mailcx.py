@@ -147,6 +147,7 @@ class MailCxClient:
         poll_interval: int = 5,
         log: Optional[Callable[[str], None]] = None,
         cancel_cb: Optional[Callable[[], bool]] = None,
+        email: str = "",  # ignored — present for API compat with LitensiClient
     ) -> str:
         """Poll the mailbox until the GitHub verification code arrives.
 

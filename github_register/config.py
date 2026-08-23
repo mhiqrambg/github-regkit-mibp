@@ -7,8 +7,15 @@ from pathlib import Path
 
 @dataclass
 class Config:
+    # Mail provider: "mailcx" (free, default) or "litensi" (paid, reliable)
+    mail_provider: str = "mailcx"  # "mailcx" | "litensi"
     # Mail.cx temp email settings
     mailcx_domain: str = ""  # empty = auto-pick from uqu.me, ddker.com, 9k3r.com
+    # Litensi Mail settings
+    litensi_api_id: str = ""
+    litensi_api_key: str = ""
+    litensi_site: str = ""   # e.g. "github.com"
+    litensi_zone: str = ""   # blank = auto-pick cheapest in-stock zone
     register_count: int = 1
     proxy: str = ""
     headless: bool = False
